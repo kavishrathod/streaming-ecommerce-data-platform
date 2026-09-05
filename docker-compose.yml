@@ -46,6 +46,24 @@ services:
     networks:
       - platform-net
 
+  redpanda-topics-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.9
+    container_name: redpanda-topics-init
+    depends_on:
+      - redpanda
+    entrypoint: >
+      /bin/sh -c "
+      sleep 8;
+      rpk topic create order-events --partitions 3 --replicas 1 --brokers redpanda:29092;
+      rpk topic create payment-events --partitions 3 --replicas 1 --brokers redpanda:29092;
+      rpk topic create product-events --partitions 3 --replicas 1 --brokers redpanda:29092;
+      rpk topic create return-events --partitions 3 --replicas 1 --brokers redpanda:29092;
+      echo 'Topics created: order-events, payment-events, product-events, return-events';
+      exit 0;
+      "
+    networks:
+      - platform-net
+
   minio:
     image: minio/minio:latest
     container_name: minio
