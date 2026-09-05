@@ -1,0 +1,89 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --memory
+      - "1G"
+      - --overprovisioned
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --pandaproxy-addr
+      - PLAINTEXT://0.0.0.0:28082,OUTSIDE://0.0.0.0:8082
+      - --advertise-pandaproxy-addr
+      - PLAINTEXT://redpanda:28082,OUTSIDE://localhost:8082
+    ports:
+      - "9092:9092"     # Kafka-compatible API (your producer connects here)
+      - "8082:8082"     # Pandaproxy (REST API for Kafka)
+      - "9644:9644"     # Admin API
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - platform-net
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    container_name: redpanda-console
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console -config.filepath /tmp/config.yml'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:29092"]
+    ports:
+      - "8080:8080"     # Web UI — browse topics, messages, consumer groups
+    depends_on:
+      - redpanda
+    networks:
+      - platform-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"     # S3-compatible API (Spark/DuckDB connect here)
+      - "9001:9001"     # Web console (browser UI)
+    volumes:
+      - minio-data:/data
+    networks:
+      - platform-net
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin123;
+      mc mb -p local/bronze;
+      mc mb -p local/silver;
+      mc mb -p local/gold;
+      mc mb -p local/quarantine;
+      echo 'Buckets created: bronze, silver, gold, quarantine';
+      exit 0;
+      "
+    networks:
+      - platform-net
+
+volumes:
+  redpanda-data:
+  minio-data:
+
+networks:
+  platform-net:
+    driver: bridge
