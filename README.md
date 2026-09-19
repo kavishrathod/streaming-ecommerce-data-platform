@@ -2,7 +2,7 @@
 
 A local, fully open-source streaming data pipeline that ingests simulated e-commerce events, validates and deduplicates them in real time, and lands them in a Bronze/Silver/Gold data lake — built to demonstrate production-style streaming data engineering, not a toy batch pipeline.
 
-**Cost: $0.** Everything runs locally via Docker — Redpanda (Kafka-compatible), Spark Structured Streaming, MinIO (S3-compatible storage), and DuckDB.
+Everything runs locally via Docker — Redpanda (Kafka-compatible), Spark Structured Streaming, MinIO (S3-compatible storage), and DuckDB.
 
 ---
 
