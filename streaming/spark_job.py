@@ -43,13 +43,14 @@ from streaming.schemas import (
 from data_quality.validators import apply_dq_checks
 from data_quality.quarantine import write_quarantine
 
-# --- MinIO / S3 connection ---
-MINIO_ENDPOINT = "http://localhost:9000"
-MINIO_ACCESS_KEY = "minioadmin"
-MINIO_SECRET_KEY = "minioadmin123"
+# --- MinIO / S3 and Redpanda connection, centralized in config/settings.py
+# (loaded from .env - never hardcoded here) ---
+from config import settings as config
 
-# --- Redpanda connection ---
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+MINIO_ENDPOINT = config.MINIO_ENDPOINT_URL
+MINIO_ACCESS_KEY = config.MINIO_ACCESS_KEY
+MINIO_SECRET_KEY = config.MINIO_SECRET_KEY
+KAFKA_BOOTSTRAP_SERVERS = config.KAFKA_BOOTSTRAP_SERVERS
 
 # --- Watermarks: Silver and Gold are independent branches (separate
 # writeStream().start() calls), each getting its own single withWatermark

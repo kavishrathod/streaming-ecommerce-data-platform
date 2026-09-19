@@ -1,9 +1,19 @@
 """
-producer/config.py — locked producer behavior settings (Phase 1-2).
+config/settings.py — centralized configuration (Phase 1-2).
 
-Change these values to tune throughput/fault rates; event_generator.py
-should never hardcode these numbers directly.
+All connection details (Kafka broker, MinIO credentials) load from
+environment variables via a .env file, never hardcoded here. See
+.env.example for the variables this expects. .env itself is gitignored -
+create it locally by copying .env.example and filling in real values.
+
+Producer behavior settings (throughput, fault rates) are NOT secrets and
+stay as plain constants below, same as before.
 """
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env in the project root, if present; no-op if missing
 
 # --- Throughput ---
 EVENTS_PER_SECOND = 5   # tune later to demo scaling: 5 -> 20 -> 100
@@ -44,7 +54,13 @@ LATE_EVENT_TYPE_BIAS = {
 }
 
 # --- Redpanda connection (host machine -> container via exposed port) ---
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+
+# --- MinIO / S3 connection - credentials loaded from .env, never hardcoded ---
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", f"http://{MINIO_ENDPOINT}")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
 
 # --- Regions used across events, matches the domain in the PRD ---
 REGIONS = ["Maharashtra", "Karnataka", "Delhi", "Tamil Nadu", "Gujarat"]

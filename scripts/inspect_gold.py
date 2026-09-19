@@ -5,9 +5,13 @@ whether Gold has no data at all yet vs. is just missing one specific window.
 """
 import duckdb, sys
 
-MINIO_ENDPOINT = "localhost:9000"
-MINIO_ACCESS_KEY = "minioadmin"
-MINIO_SECRET_KEY = "minioadmin123"
+import sys as _sys, os as _os
+_sys.path.append(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from config import settings as _config
+
+MINIO_ENDPOINT = _config.MINIO_ENDPOINT
+MINIO_ACCESS_KEY = _config.MINIO_ACCESS_KEY
+MINIO_SECRET_KEY = _config.MINIO_SECRET_KEY
 
 topic = sys.argv[1] if len(sys.argv) > 1 else "return-events"
 

@@ -15,9 +15,13 @@ topic defaults to "order-events" if not given.
 import sys
 import duckdb
 
-MINIO_ENDPOINT = "localhost:9000"
-MINIO_ACCESS_KEY = "minioadmin"
-MINIO_SECRET_KEY = "minioadmin123"
+import sys as _sys, os as _os
+_sys.path.append(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from config import settings as _config
+
+MINIO_ENDPOINT = _config.MINIO_ENDPOINT
+MINIO_ACCESS_KEY = _config.MINIO_ACCESS_KEY
+MINIO_SECRET_KEY = _config.MINIO_SECRET_KEY
 
 
 def main():

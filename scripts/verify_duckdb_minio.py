@@ -17,9 +17,13 @@ import duckdb
 import pandas as pd
 from datetime import datetime, timezone
 
-MINIO_ENDPOINT = "localhost:9000"
-MINIO_ACCESS_KEY = "minioadmin"
-MINIO_SECRET_KEY = "minioadmin123"
+import sys as _sys, os as _os
+_sys.path.append(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from config import settings as _config
+
+MINIO_ENDPOINT = _config.MINIO_ENDPOINT
+MINIO_ACCESS_KEY = _config.MINIO_ACCESS_KEY
+MINIO_SECRET_KEY = _config.MINIO_SECRET_KEY
 BUCKET = "gold"
 TEST_KEY = "smoke_test/sample.parquet"
 
