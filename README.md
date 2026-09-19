@@ -2,7 +2,7 @@
 
 A local, fully open-source streaming data pipeline that ingests simulated e-commerce events, validates and deduplicates them in real time, and lands them in a Bronze/Silver/Gold data lake — built to demonstrate production-style streaming data engineering, not a toy batch pipeline.
 
-Everything runs locally via Docker — Redpanda (Kafka-compatible), Spark Structured Streaming, MinIO (S3-compatible storage), and DuckDB.
+**Cost: $0.** Everything runs locally via Docker — Redpanda (Kafka-compatible), Spark Structured Streaming, MinIO (S3-compatible storage), and DuckDB.
 
 ---
 
@@ -38,6 +38,24 @@ DuckDB reads Gold Parquet directly off MinIO — no separate load step.
 
 ---
 
+## Data Flow
+
+The lifecycle of one event, end to end:
+
+1. The Python producer generates simulated e-commerce events.
+2. Events are published to Redpanda topics using domain-specific partition keys (`order_id` / `product_id`).
+3. Spark Structured Streaming consumes the topics.
+4. Raw JSON and Kafka metadata are written to **Bronze** before any parsing happens.
+5. Events are parsed against their event-specific schemas.
+6. Schema and business-rule validation classify each event as valid or invalid.
+7. Invalid events are preserved in **Quarantine** with the original payload and failure reason — never dropped silently.
+8. Valid events go down two independent branches:
+   - **Silver**: a tight 10-minute watermark bounds deduplication state; deduplicated events land as Parquet.
+   - **Gold**: a generous 7-day watermark allows late-arriving events (especially `product_returned`) to still be aggregated into 5-minute windows.
+9. DuckDB queries Gold Parquet directly off MinIO — no separate load step.
+
+---
+
 ## Tech Stack
 
 | Layer | Technology |
@@ -58,9 +76,9 @@ DuckDB reads Gold Parquet directly off MinIO — no separate load step.
 - **Schema validation** — required-field and type checks, driven per-row by event type
 - **Business-rule validation** — semantic checks (negative amounts, invalid statuses) distinct from schema checks
 - **Quarantine, not silent drop** — every invalid record is preserved with its original JSON payload and failure reason, partitioned by status and date
-- **Deduplication** — exactly-once semantics via `event_id`, verified: duplicate events appearing 2x in Bronze collapse to 1x in Silver
-- **Watermarking / late-event handling** — events arriving up to 7 days late (realistic for return events) are still processed, not dropped
-- **Checkpointing / restart recovery** — verified by killing the Spark job mid-run and restarting; zero reprocessing, zero data loss
+- **Deduplication** — event-level duplicate protection using `event_id`, verified by comparing Bronze and Silver records (a duplicate appearing 2x in Bronze collapses to 1x in Silver)
+- **Watermarking / late-event handling** — Gold uses a 7-day event-time watermark so sufficiently late events, including delayed product_returned events within the configured watermark, can contribute to windowed aggregation.
+- **Checkpointing / restart recovery** — restart behavior verified by killing the Spark job mid-run and restarting, then validating the resulting stream state (no duplicate `event_id`s attributable to the restart)
 - **Bronze/Silver/Gold medallion architecture** — raw fidelity preserved, then progressively cleaned and aggregated
 
 ---
@@ -72,7 +90,7 @@ Four event types, each independently schema-locked:
 - `order_created` — order placement events
 - `payment_completed` — payment lifecycle events, linked via `order_id`
 - `product_viewed` / `stock_updated` — catalog/inventory events (shared topic)
-- `product_returned` — return events, linked via `order_id` and `product_id`; deliberately the most likely to arrive late, matching real-world return behavior
+- `product_returned` — return events, linked via `order_id` and `product_id`; deliberately modeled as the most likely event type to arrive late.
 
 ## Fault Injection (Producer)
 
@@ -113,15 +131,78 @@ One-off scripts (in `scripts/`) used to prove each pipeline guarantee, not part 
 - `verify_duckdb_minio.py` — confirms the MinIO → Parquet → DuckDB read path
 - `verify_dedup.py` — confirms duplicate `event_id`s collapse from Bronze to Silver
 - `verify_watermark.py` — confirms late events survive into Silver rather than being dropped
-- `verify_restart_recovery.py` — confirms no reprocessing occurs after a crash + restart
+- `verify_restart_recovery.py` — validates the resulting stream state after stopping and restarting the Spark job.
+---
+
+## Failure Handling
+
+| Failure / Data Issue | Handling |
+|---|---|
+| Duplicate event | `event_id` deduplication (Silver branch) |
+| Missing/invalid field | Quarantine, tagged `schema_violation` |
+| Business-rule violation (negative amount, invalid status, etc.) | Quarantine, tagged `business_rule_violation` |
+| Late-arriving event | Event-time watermark (7 days on the Gold branch) |
+| Spark process crash/restart | Streaming checkpoints allow the query to resume from its recorded source progress |
+| Malformed/corrupt raw payload | Preserved as-is in Bronze before parsing, so the original payload remains available for investigation even if parsing fails |
+| Analytics query | DuckDB reads Gold Parquet directly — no separate load/ETL step to fail |
+
+---
+
+## Key Design Decisions
+
+**Redpanda instead of direct producer → Spark communication**
+A Kafka-compatible event buffer that decouples event production from stream processing and allows events to remain available while the consumer is temporarily unavailable.
+
+**MinIO instead of cloud object storage**
+S3-compatible local object storage, so the whole project runs free and reproducibly on any machine with Docker.
+
+**Parquet instead of raw JSON for Silver/Gold**
+Columnar format suited to analytical workloads and directly queryable by DuckDB.
+
+**Bronze written before parsing**
+Preserves the original event and Kafka metadata before downstream parsing, making malformed or type-corrupted records available for investigation.
+
+**Separate Silver and Gold streaming queries**
+Spark computes one global watermark per event-time column *within a single query plan*. Splitting Silver and Gold into independent queries lets each have its own watermark safely — a tight one for Silver's dedup state, a generous one for Gold's late-event tolerance — without one silently overriding the other.
+
+**DuckDB instead of a separate analytical database**
+Queries Gold Parquet directly off MinIO with no server to run and no separate load step.
+
+---
+
+## Production-Style vs. Local Scope
+
+This project intentionally runs as a local production-style simulation — the patterns are real, the infrastructure is scaled down to run free on a laptop.
+
+**Implemented:**
+- Kafka-compatible streaming ingestion with topic partitioning
+- Structured streaming with event-time processing
+- Schema and business-rule data-quality validation
+- Quarantine with original-payload preservation
+- Deduplication, watermarking, checkpointing/restart recovery
+- Bronze/Silver/Gold medallion architecture
+- S3-compatible object storage, Parquet, direct analytical querying
+
+**Local simplifications:**
+- Single Redpanda broker (no multi-broker cluster/replication)
+- Local MinIO instead of managed cloud object storage
+- Simulated event producer instead of real transaction traffic
+- Local Spark execution (no cluster manager / multi-node)
+- No Kubernetes deployment, no cloud monitoring/alerting stack
+
+The core data-flow design can be migrated to a managed/cloud environment with relatively limited architectural change — for example, Redpanda → Amazon MSK/Confluent, MinIO → Amazon S3, and local Spark → Amazon EMR/Databricks. The core streaming, validation, storage, and analytical processing patterns would remain the same, while infrastructure-specific configuration and operational concerns would change.
 
 ---
 
 ## Project Scope
 
-This is intentionally scoped in two phases. **Phase 1–2 (this repo, fully complete) is the required deliverable**: infrastructure, streaming ingestion, validation, quarantine, deduplication, watermarking, and checkpointing.
+This repository contains the completed core Data Engineering pipeline:
+infrastructure, streaming ingestion, validation, quarantine,
+deduplication, watermarking, checkpointing, and analytical querying.
 
-Everything beyond that — DuckDB-backed natural-language analytics via a local LLM, Airflow batch orchestration, a Streamlit dashboard — is explicitly out of scope for v1 and treated as optional future work, not a gap in this deliverable.
+Potential future extensions include local LLM-powered analytics,
+Airflow-based batch workflows, and a Streamlit dashboard.
+These are intentionally outside the current project scope.
 
 ---
 
