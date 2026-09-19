@@ -3,7 +3,11 @@ data_quality/validators.py
 
 Two distinct validation classes, matching the producer's fault design:
 
-1. Schema validation  - required field is null/missing after JSON parsing.
+1. Schema validation  - required field is null/missing after JSON parsing,
+   OR event_type itself is null/unrecognized (which happens when from_json
+   fails entirely on malformed JSON, producing an all-null parsed struct -
+   without this check such a row would match none of the per-type null-field
+   checks below and would incorrectly pass through as "valid").
 2. Business-rule validation - field is present and correctly typed, but the
    value violates a domain rule (negative amount, unknown status, etc).
 
@@ -36,11 +40,14 @@ def add_schema_check(df: DataFrame) -> DataFrame:
     Required fields are looked up per-row from the row's own event_type,
     via a when/otherwise chain over REQUIRED_FIELDS - so a single call
     handles a DataFrame containing multiple event types correctly.
-    """
-    all_fields = sorted({f for fields in REQUIRED_FIELDS.values() for f in fields})
 
-    is_null_any = F.lit(False)
-    reason_parts = []
+    A null or unrecognized event_type is ALWAYS a schema violation.
+    """
+    known_types = list(REQUIRED_FIELDS.keys())
+    unknown_type = ~F.col("event_type").isin(*known_types)
+
+    is_null_any = unknown_type
+    reason_parts = [F.when(unknown_type, F.lit("unknown_or_missing_event_type"))]
     for event_type, required in REQUIRED_FIELDS.items():
         for f in required:
             applies_and_null = (F.col("event_type") == event_type) & F.col(f).isNull()
@@ -48,7 +55,7 @@ def add_schema_check(df: DataFrame) -> DataFrame:
             reason_parts.append(F.when(applies_and_null, F.lit(f)))
 
     reason_array = F.array_remove(F.array(*[F.coalesce(p, F.lit("")) for p in reason_parts]), "")
-    reason = F.concat(F.lit("null field(s): "), F.concat_ws(", ", reason_array))
+    reason = F.concat(F.lit("null field(s)/invalid type: "), F.concat_ws(", ", reason_array))
 
     return df.withColumn("_schema_ok", ~is_null_any).withColumn(
         "_schema_reason", F.when(is_null_any, reason).otherwise(F.lit(None))
@@ -59,13 +66,15 @@ def add_business_rule_check(df: DataFrame) -> DataFrame:
     """
     Adds `_business_ok` (bool) and `_business_reason` (string or null).
     Rule applied is chosen per-row based on the row's own event_type.
+    product_viewed has NO stock check - stock is not a meaningful concept
+    for a view event; only stock_updated checks stock_quantity.
     """
     et = F.col("event_type")
 
     bad = (
         F.when(et == "order_created", F.col("total_amount") < 0)
         .when(et == "payment_completed", ~F.col("status").isin("success", "failed"))
-        .when(et == "product_viewed", F.lit(False))  # no stock check for views - stock is not meaningful here
+        .when(et == "product_viewed", F.lit(False))
         .when(et == "stock_updated", F.col("stock_quantity") < 0)
         .when(
             et == "product_returned",

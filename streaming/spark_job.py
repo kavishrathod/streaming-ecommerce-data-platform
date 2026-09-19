@@ -3,15 +3,22 @@ streaming/spark_job.py — Phase 2 flagship deliverable.
 
 For each of the four event topics, this job:
   1. Reads from Redpanda (Kafka-compatible) as a stream.
-  2. Parses JSON against the locked StructType schema.
-  3. Runs schema + business-rule DQ checks (data_quality/validators.py).
-  4. Routes invalid records to the `quarantine` bucket - never dropped silently.
-  5. Deduplicates valid records by event_id within a watermark window.
-  6. Writes valid, deduplicated records to Bronze (raw-ish, post-parse) and
-     Silver (deduplicated, DQ-passed) as Parquet on MinIO.
-  7. Runs a small windowed aggregation into Gold (event counts / amounts per
-     region per window) - this is also where watermarking/late-event
-     handling is visibly demonstrated.
+  2. Writes the untouched raw JSON + Kafka metadata to Bronze BEFORE parsing,
+     so a schema-violating or type-corrupted record still has its original
+     bytes preserved there.
+  3. Parses JSON against the locked StructType schema.
+  4. Runs schema + business-rule DQ checks (data_quality/validators.py),
+     driven by each row's own event_type column - handles a mixed-type
+     topic (product-events: product_viewed + stock_updated) in one pass.
+     A null/unrecognized event_type is always a schema violation.
+  5. Routes invalid records to the `quarantine` bucket - never dropped
+     silently, and the original json_value is preserved there too.
+  6. Valid records go down two INDEPENDENT branches, each with its own
+     single watermark (deliberately not chained/shared - see note below):
+       - Silver branch: dedup with a tight 10-minute watermark.
+       - Gold branch: dedup with a generous 7-day watermark, then a small
+         windowed aggregation - this is where late-arriving events
+         (especially product_returned) are visibly still counted.
 
 Run:
     spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,\
@@ -44,11 +51,13 @@ MINIO_SECRET_KEY = "minioadmin123"
 # --- Redpanda connection ---
 KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
 
-# --- Watermark: how late an event can arrive and still be processed for
-# windowed aggregation. Returns can be legitimately days late, but for a
-# first version we cap the watermark generously rather than unbounded. ---
-WATERMARK_DELAY = "7 days"
-DEDUP_WATERMARK_DELAY = "10 minutes"   # separate, tighter window just for de-dup
+# --- Watermarks: Silver and Gold are independent branches (separate
+# writeStream().start() calls), each getting its own single withWatermark
+# call. This sidesteps any ambiguity about Spark's multipleWatermarkPolicy
+# entirely - they never share a chained lineage, so there's no question of
+# one watermark silently overriding the other. ---
+SILVER_DEDUP_WATERMARK = "10 minutes"   # tight - bounds Silver's dedup state store
+GOLD_WATERMARK = "7 days"               # generous - lets late product_returned events still be aggregated
 
 TOPICS = {
     "order-events": ORDER_EVENT_SCHEMA,
@@ -84,12 +93,8 @@ def build_spark_session() -> SparkSession:
     )
 
 
-def read_topic_stream(spark: SparkSession, topic: str, schema):
-    """
-    Returns the raw stream (untouched JSON + Kafka metadata, for Bronze)
-    and does NOT parse here - parsing happens separately so a malformed
-    or type-corrupted payload's original bytes are still preserved in Bronze.
-    """
+def read_topic_stream(spark: SparkSession, topic: str):
+    """Raw stream: untouched JSON + Kafka metadata, for Bronze. No parsing here."""
     raw = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
@@ -110,11 +115,23 @@ def read_topic_stream(spark: SparkSession, topic: str, schema):
 
 
 def parse_events(raw_with_meta, schema):
-    """Parses json_value against the schema. Called AFTER Bronze has already
-    persisted the untouched raw payload, so parse failures never lose data."""
+    """
+    Parses json_value against the schema. Called AFTER Bronze has already
+    persisted the untouched raw payload, so parse failures never lose data.
+    json_value is kept in the output (not dropped) so quarantine can still
+    show the original payload for invalid rows; Silver drops it explicitly
+    later since it's not needed for clean, validated data.
+    """
     parsed = (
         raw_with_meta.withColumn("data", F.from_json(F.col("json_value"), schema))
-        .select("data.*", "kafka_timestamp", "kafka_key", "kafka_partition", "kafka_offset")
+        .select(
+            "data.*",
+            "json_value",
+            "kafka_key",
+            "kafka_partition",
+            "kafka_offset",
+            "kafka_timestamp",
+        )
         .withColumn("event_timestamp", F.to_timestamp("event_timestamp"))
         .withColumn("ingestion_timestamp", F.to_timestamp("ingestion_timestamp"))
     )
@@ -126,12 +143,11 @@ def run_pipeline_for_topic(spark: SparkSession, topic: str, schema):
     Sets up the full Bronze -> DQ split -> Silver -> Gold chain for one topic.
     Returns the list of active StreamingQuery objects so main() can await them.
     """
-    raw_with_meta = read_topic_stream(spark, topic, schema)
+    raw_with_meta = read_topic_stream(spark, topic)
     queries = []
 
     # --- Bronze: the untouched raw JSON payload + Kafka metadata, exactly as
-    # received. This is written BEFORE parsing, so a schema-violating or
-    # type-corrupted record still has its original bytes preserved here. ---
+    # received, written BEFORE parsing. ---
     bronze_query = (
         raw_with_meta.writeStream.format("parquet")
         .option("path", f"s3a://bronze/{topic}")
@@ -145,28 +161,31 @@ def run_pipeline_for_topic(spark: SparkSession, topic: str, schema):
     parsed = parse_events(raw_with_meta, schema)
 
     # --- DQ check. Driven by each row's own event_type column, so a topic
-    # carrying multiple event types (product-events: product_viewed +
-    # stock_updated) is handled correctly in a single pass - no cross-frame
-    # merging needed. ---
+    # carrying multiple event types (product-events) is handled correctly
+    # in a single pass. Null/unknown event_type is always a violation. ---
     checked = apply_dq_checks(parsed)
 
     invalid = checked.filter(F.col("_dq_status") != "valid")
     valid = checked.filter(F.col("_dq_status") == "valid").drop("_dq_status", "_dq_reason")
 
-    # --- Quarantine: invalid records, never dropped silently ---
+    # --- Quarantine: invalid records, never dropped silently. json_value
+    # (the original payload) is still present here - not yet dropped. ---
     quarantine_query = write_quarantine(
         invalid, topic, quarantine_path="s3a://quarantine", checkpoint_path="s3a://quarantine/_checkpoints"
     )
     queries.append(quarantine_query)
 
-    # --- Deduplication: drop repeat event_id within a watermark window ---
-    deduped = valid.withWatermark("event_timestamp", DEDUP_WATERMARK_DELAY).dropDuplicates(
-        ["event_id"]
+    # --- Silver branch: independent from Gold. Own watermark, own dedup,
+    # own state store bounded to 10 minutes. json_value dropped here - not
+    # needed once data has passed DQ and is clean. ---
+    silver_deduped = (
+        valid.drop("json_value")
+        .withWatermark("event_timestamp", SILVER_DEDUP_WATERMARK)
+        .dropDuplicates(["event_id"])
     )
 
-    # --- Silver: cleaned, deduplicated, DQ-passed events ---
     silver_query = (
-        deduped.writeStream.format("parquet")
+        silver_deduped.writeStream.format("parquet")
         .option("path", f"s3a://silver/{topic}")
         .option("checkpointLocation", f"s3a://silver/_checkpoints/{topic}")
         .outputMode("append")
@@ -174,18 +193,21 @@ def run_pipeline_for_topic(spark: SparkSession, topic: str, schema):
     )
     queries.append(silver_query)
 
-    # --- Gold: windowed aggregation. Dimension differs per topic, since not
-    # every event schema has a `region` field - grouping by a column that
-    # doesn't exist would crash the job, not just misbehave. ---
+    # --- Gold branch: independent from Silver. Own watermark, generous
+    # enough that a product_returned event arriving days late is still
+    # picked up by the windowed aggregation - this is the visible proof of
+    # late-event handling the project is meant to demonstrate. ---
     gold_dimension = GOLD_DIMENSION_BY_TOPIC[topic]
-    gold_agg = (
-        deduped.withWatermark("event_timestamp", WATERMARK_DELAY)
-        .groupBy(
-            F.window("event_timestamp", "5 minutes"),
-            F.coalesce(F.col(gold_dimension), F.lit("unknown")).alias(gold_dimension),
-        )
-        .agg(F.count("*").alias("event_count"))
+    gold_deduped = (
+        valid.drop("json_value")
+        .withWatermark("event_timestamp", GOLD_WATERMARK)
+        .dropDuplicates(["event_id"])
     )
+
+    gold_agg = gold_deduped.groupBy(
+        F.window("event_timestamp", "5 minutes"),
+        F.coalesce(F.col(gold_dimension), F.lit("unknown")).alias(gold_dimension),
+    ).agg(F.count("*").alias("event_count"))
 
     gold_query = (
         gold_agg.writeStream.format("parquet")

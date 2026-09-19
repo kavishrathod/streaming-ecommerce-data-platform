@@ -4,6 +4,9 @@ data_quality/quarantine.py
 Invalid records are never dropped silently - they land in the `quarantine`
 bucket with their DQ status/reason attached, partitioned by DQ status and
 ingestion date, so they're browsable and debuggable later (e.g. via DuckDB).
+The original json_value payload is preserved here (unlike Silver, which
+drops it) - critical for debugging exactly what malformed/invalid data
+actually looked like on the wire.
 """
 
 from pyspark.sql import DataFrame
