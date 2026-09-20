@@ -132,6 +132,7 @@ One-off scripts (in `scripts/`) used to prove each pipeline guarantee, not part 
 - `verify_dedup.py` — confirms duplicate `event_id`s collapse from Bronze to Silver
 - `verify_watermark.py` — confirms late events survive into Silver rather than being dropped
 - `verify_restart_recovery.py` — validates the resulting stream state after stopping and restarting the Spark job.
+
 ---
 
 ## Failure Handling
